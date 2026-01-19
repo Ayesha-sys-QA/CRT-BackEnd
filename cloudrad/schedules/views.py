@@ -1,6 +1,4 @@
-from django.shortcuts import render
 
-# Create your views here.
 # schedules/views.py
 from django.shortcuts import get_object_or_404
 from django.db.models import Q, Count, Prefetch
@@ -11,20 +9,22 @@ from rest_framework.response import Response
 from django.core.paginator import Paginator
 from django.utils import timezone
 from datetime import datetime, time, timedelta
+from django.db import transaction
 import json
 
-from .models import Shift, ScheduleDay, UserSchedule
+from .models import Shift, ScheduleEvent, ScheduleTemplate, TemplateDay
 from .serializers import (
-    ShiftSerializer, ShiftCreateSerializer,
-    ScheduleDaySerializer, ScheduleDayCreateSerializer,
-    UserScheduleSerializer, UserScheduleCreateSerializer,
-    UserScheduleBulkSerializer, UserWeeklyScheduleSerializer,
-    DayScheduleSerializer, ShiftAssignmentSerializer
+    ShiftSerializer, ScheduleEventSerializer, ScheduleEventCreateSerializer,
+    ScheduleEventBulkCreateSerializer, ScheduleTemplateSerializer,
+    TemplateDaySerializer, UserScheduleViewSerializer
 )
 from users.models import User
+from patients.models import Patient
 import logging
 
 logger = logging.getLogger(__name__)
+
+INVALID_DATE_FORMAT_ERROR = 'Invalid date format. Use YYYY-MM-DD'
 
 
 # ==================== SHIFT MANAGEMENT VIEWS ====================
@@ -45,9 +45,8 @@ def shift_list(request):
     
     if search:
         shifts = shifts.filter(
-            Q(shift_type__icontains=search) |
-            Q(start_time__icontains=search) |
-            Q(end_time__icontains=search)
+            Q(name__icontains=search) |
+            Q(description__icontains=search)
         )
     
     serializer = ShiftSerializer(shifts, many=True)
@@ -64,14 +63,14 @@ def create_shift(request):
     """
     Create a new shift (admin only)
     """
-    serializer = ShiftCreateSerializer(data=request.data)
+    serializer = ShiftSerializer(data=request.data)
     
     if serializer.is_valid():
-        shift = serializer.save()
+        serializer.save()
         
         return Response({
             'message': 'Shift created successfully',
-            'shift': ShiftSerializer(shift).data
+            'shift': serializer.data
         }, status=status.HTTP_201_CREATED)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -99,10 +98,10 @@ def shift_detail(request, shift_id):
         serializer = ShiftSerializer(shift, data=request.data, partial=partial)
         
         if serializer.is_valid():
-            shift = serializer.save()
+            serializer.save()
             return Response({
                 'message': 'Shift updated successfully',
-                'shift': ShiftSerializer(shift).data
+                'shift': serializer.data
             }, status=status.HTTP_200_OK)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -113,10 +112,10 @@ def shift_detail(request, shift_id):
                 'error': 'Only administrators can delete shifts'
             }, status=status.HTTP_403_FORBIDDEN)
         
-        # Check if shift is used in any schedule day
-        if shift.scheduleday_set.exists():
+        # Check if shift is used in any schedule events
+        if ScheduleEvent.objects.filter(shift=shift).exists():
             return Response({
-                'error': 'Cannot delete shift that is assigned to schedule days'
+                'error': 'Cannot delete shift that is used in schedule events'
             }, status=status.HTTP_400_BAD_REQUEST)
         
         shift.delete()
@@ -125,52 +124,109 @@ def shift_detail(request, shift_id):
         }, status=status.HTTP_200_OK)
 
 
-# ==================== SCHEDULE DAY MANAGEMENT VIEWS ====================
+# ==================== SCHEDULE EVENT VIEWS ====================
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-def schedule_day_list(request):
+def schedule_event_list(request):
     """
-    List all schedule days
+    List all schedule events with filtering
     """
-    days = ScheduleDay.objects.select_related('shift').prefetch_related(
-        'user_schedules__user'
-    ).order_by('day_name')
+    # Start with base queryset
+    if request.user.is_staff:
+        events = ScheduleEvent.objects.all()
+    else:
+        events = ScheduleEvent.objects.filter(user=request.user)
+    
+    events = events.select_related('user', 'shift', 'patient', 'created_by')
     
     # Apply filters
-    day_name = request.query_params.get('day')
-    has_shift = request.query_params.get('has_shift')
+    user_id = request.query_params.get('user_id')
+    start_date = request.query_params.get('start_date')
+    end_date = request.query_params.get('end_date')
+    event_type = request.query_params.get('event_type')
+    department = request.query_params.get('department')
+    status_filter = request.query_params.get('status')
     
-    if day_name:
-        days = days.filter(day_name=day_name)
+    if user_id and request.user.is_staff:
+        events = events.filter(user_id=user_id)
     
-    if has_shift and has_shift.lower() in ['true', 'false']:
-        if has_shift.lower() == 'true':
-            days = days.filter(shift__isnull=False)
-        else:
-            days = days.filter(shift__isnull=True)
+    if start_date:
+        try:
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+            events = events.filter(end_date__gte=start_date)
+        except ValueError:
+            return Response({
+                'error': INVALID_DATE_FORMAT_ERROR
+            }, status=status.HTTP_400_BAD_REQUEST)
     
-    serializer = ScheduleDaySerializer(days, many=True, context={'request': request})
+    if end_date:
+        try:
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+            events = events.filter(start_date__lte=end_date)
+        except ValueError:
+            return Response({
+                'error': INVALID_DATE_FORMAT_ERROR
+            }, status=status.HTTP_400_BAD_REQUEST)
+    
+    if event_type:
+        events = events.filter(event_type=event_type)
+    
+    if department:
+        events = events.filter(department=department)
+    
+    if status_filter:
+        events = events.filter(status=status_filter)
+    
+    # Pagination
+    page = request.query_params.get('page', 1)
+    page_size = request.query_params.get('page_size', 20)
+    
+    try:
+        page = int(page)
+        page_size = int(page_size)
+    except ValueError:
+        return Response({
+            'error': 'Invalid page or page_size parameter'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    paginator = Paginator(events.order_by('start_date', 'start_time'), page_size)
+    try:
+        paginated_events = paginator.page(page)
+    except:
+        return Response({
+            'error': 'Invalid page number'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    serializer = ScheduleEventSerializer(paginated_events, many=True, context={'request': request})
     
     return Response({
-        'count': days.count(),
-        'days': serializer.data
+        'count': events.count(),
+        'page': page,
+        'page_size': page_size,
+        'total_pages': paginator.num_pages,
+        'results': serializer.data
     }, status=status.HTTP_200_OK)
 
 
 @api_view(['POST'])
-@permission_classes([IsAdminUser])
-def create_schedule_day(request):
+@permission_classes([IsAuthenticated])
+def create_schedule_event(request):
     """
-    Create a new schedule day (admin only)
+    Create a new schedule event
     """
-    serializer = ScheduleDayCreateSerializer(data=request.data)
+    # Users can only create events for themselves unless they're admin
+    data = request.data.copy()
+    if not request.user.is_staff:
+        data['user'] = str(request.user.id)
+    
+    serializer = ScheduleEventCreateSerializer(data=data, context={'request': request})
     
     if serializer.is_valid():
-        day = serializer.save()
+        event = serializer.save(created_by=request.user)
         
         return Response({
-            'message': 'Schedule day created successfully',
-            'day': ScheduleDaySerializer(day, context={'request': request}).data
+            'message': 'Schedule event created successfully',
+            'event': ScheduleEventSerializer(event, context={'request': request}).data
         }, status=status.HTTP_201_CREATED)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -178,218 +234,120 @@ def create_schedule_day(request):
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @permission_classes([IsAuthenticated])
-def schedule_day_detail(request, day_id):
+def schedule_event_detail(request, event_id):
     """
-    Retrieve, update, or delete a schedule day
+    Retrieve, update, or delete a schedule event
     """
-    day = get_object_or_404(
-        ScheduleDay.objects.select_related('shift').prefetch_related('user_schedules__user'),
-        id=day_id
+    event = get_object_or_404(
+        ScheduleEvent.objects.select_related('user', 'shift', 'patient'),
+        id=event_id
     )
     
+    # Check permissions
+    if event.user != request.user and not request.user.is_staff:
+        return Response({
+            'error': 'You do not have permission to access this event'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
     if request.method == 'GET':
-        serializer = ScheduleDaySerializer(day, context={'request': request})
+        serializer = ScheduleEventSerializer(event, context={'request': request})
         return Response(serializer.data, status=status.HTTP_200_OK)
     
     elif request.method in ['PUT', 'PATCH']:
-        if not request.user.is_staff:
+        # Users can only update their own events unless they're admin
+        if event.user != request.user and not request.user.is_staff:
             return Response({
-                'error': 'Only administrators can update schedule days'
+                'error': 'You can only update your own schedule events'
             }, status=status.HTTP_403_FORBIDDEN)
         
         partial = request.method == 'PATCH'
-        serializer = ScheduleDaySerializer(day, data=request.data, partial=partial, context={'request': request})
+        serializer = ScheduleEventSerializer(event, data=request.data, partial=partial, context={'request': request})
         
         if serializer.is_valid():
-            day = serializer.save()
+            serializer.save()
             return Response({
-                'message': 'Schedule day updated successfully',
-                'day': ScheduleDaySerializer(day, context={'request': request}).data
+                'message': 'Schedule event updated successfully',
+                'event': serializer.data
             }, status=status.HTTP_200_OK)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
     elif request.method == 'DELETE':
-        if not request.user.is_staff:
+        # Users can only delete their own events unless they're admin
+        if event.user != request.user and not request.user.is_staff:
             return Response({
-                'error': 'Only administrators can delete schedule days'
+                'error': 'You can only delete your own schedule events'
             }, status=status.HTTP_403_FORBIDDEN)
         
-        # Check if day has any user assignments
-        if day.user_schedules.exists():
-            return Response({
-                'error': 'Cannot delete schedule day that has user assignments'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        day.delete()
+        event.delete()
         return Response({
-            'message': 'Schedule day deleted successfully'
+            'message': 'Schedule event deleted successfully'
         }, status=status.HTTP_200_OK)
 
 
 @api_view(['POST'])
 @permission_classes([IsAdminUser])
-def assign_shift_to_day(request):
+def bulk_create_schedule_events(request):
     """
-    Assign or remove shift from a schedule day
+    Bulk create schedule events for multiple users (admin only)
     """
-    serializer = ShiftAssignmentSerializer(data=request.data)
+    serializer = ScheduleEventBulkCreateSerializer(data=request.data)
     
     if serializer.is_valid():
-        schedule_day = serializer.validated_data['schedule_day']
-        shift = serializer.validated_data.get('shift')
+        data = serializer.validated_data
+        user_ids = data['user_ids']
+        start_date = data['start_date']
+        end_date = data['end_date']
+        event_type = data.get('event_type', 'shift')
         
-        schedule_day.shift = shift
-        schedule_day.save()
+        created_events = []
+        skipped_users = []
         
-        action = 'assigned' if shift else 'removed'
-        
-        return Response({
-            'message': f'Shift {action} successfully',
-            'day': ScheduleDaySerializer(schedule_day, context={'request': request}).data
-        }, status=status.HTTP_200_OK)
-    
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-# ==================== USER SCHEDULE ASSIGNMENT VIEWS ====================
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def user_schedule_list(request):
-    """
-    List all user schedule assignments
-    """
-    user_schedules = UserSchedule.objects.select_related(
-        'user', 'schedule_day', 'schedule_day__shift'
-    ).order_by('schedule_day__day_name', 'user__first_name')
-    
-    # Apply filters
-    user_id = request.query_params.get('user_id')
-    day_id = request.query_params.get('day_id')
-    
-    if user_id:
-        user_schedules = user_schedules.filter(user_id=user_id)
-    
-    if day_id:
-        user_schedules = user_schedules.filter(schedule_day_id=day_id)
-    
-    serializer = UserScheduleSerializer(user_schedules, many=True, context={'request': request})
-    
-    return Response({
-        'count': user_schedules.count(),
-        'assignments': serializer.data
-    }, status=status.HTTP_200_OK)
-
-
-@api_view(['POST'])
-@permission_classes([IsAdminUser])
-def assign_user_to_schedule(request):
-    """
-    Assign a user to a schedule day
-    """
-    serializer = UserScheduleCreateSerializer(data=request.data)
-    
-    if serializer.is_valid():
-        user_schedule = serializer.save()
+        with transaction.atomic():
+            for user_id in user_ids:
+                user = get_object_or_404(User, id=user_id)
+                
+                # Check for conflicts
+                conflicts = ScheduleEvent.objects.filter(
+                    user=user,
+                    status__in=['scheduled', 'confirmed'],
+                    start_date__lte=end_date,
+                    end_date__gte=start_date
+                )
+                
+                if conflicts.exists():
+                    skipped_users.append({
+                        'user_id': str(user.id),
+                        'user_name': user.get_full_name(),
+                        'reason': 'Schedule conflict'
+                    })
+                    continue
+                
+                # Create the event
+                event = ScheduleEvent.objects.create(
+                    user=user,
+                    title=f"{Shift.name} - {user.get_full_name()}",
+                    event_type=event_type,
+                    start_date=start_date,
+                    end_date=end_date,
+                    start_time=Shift.start_time,
+                    end_time=Shift.end_time,
+                    shift=Shift,
+                    status='scheduled',
+                    department=user.department if hasattr(user, 'department') else '',
+                    created_by=request.user
+                )
+                created_events.append(ScheduleEventSerializer(event, context={'request': request}).data)
         
         return Response({
-            'message': 'User assigned to schedule successfully',
-            'assignment': UserScheduleSerializer(user_schedule, context={'request': request}).data
+            'message': f'{len(created_events)} events created successfully',
+            'created_count': len(created_events),
+            'skipped_count': len(skipped_users),
+            'created_events': created_events,
+            'skipped_users': skipped_users
         }, status=status.HTTP_201_CREATED)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-@api_view(['POST'])
-@permission_classes([IsAdminUser])
-def bulk_assign_users(request):
-    """
-    Bulk assign multiple users to a schedule day
-    """
-    serializer = UserScheduleBulkSerializer(data=request.data)
-    
-    if serializer.is_valid():
-        schedule_day = serializer.validated_data['schedule_day']
-        users = serializer.validated_data['users']
-        
-        created_count = 0
-        assignments = []
-        
-        for user in users:
-            # Check if assignment already exists
-            if not UserSchedule.objects.filter(user=user, schedule_day=schedule_day).exists():
-                user_schedule = UserSchedule.objects.create(
-                    user=user,
-                    schedule_day=schedule_day
-                )
-                created_count += 1
-                assignments.append(UserScheduleSerializer(user_schedule, context={'request': request}).data)
-        
-        return Response({
-            'message': f'{created_count} users assigned to schedule',
-            'created_count': created_count,
-            'assignments': assignments
-        }, status=status.HTTP_200_OK)
-    
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-@api_view(['DELETE'])
-@permission_classes([IsAuthenticated])
-def remove_user_from_schedule(request, assignment_id):
-    """
-    Remove a user from a schedule day
-    """
-    user_schedule = get_object_or_404(UserSchedule, id=assignment_id)
-    
-    # Check permissions - admin or the user themselves
-    if not request.user.is_staff and request.user != user_schedule.user:
-        return Response({
-            'error': 'You can only remove your own schedule assignments'
-        }, status=status.HTTP_403_FORBIDDEN)
-    
-    user_schedule.delete()
-    
-    return Response({
-        'message': 'User removed from schedule successfully'
-    }, status=status.HTTP_200_OK)
-
-
-@api_view(['POST'])
-@permission_classes([IsAdminUser])
-def bulk_remove_users_from_schedule(request):
-    """
-    Bulk remove users from a schedule day
-    """
-    schedule_day_id = request.data.get('schedule_day_id')
-    user_ids = request.data.get('user_ids', [])
-    
-    if not schedule_day_id:
-        return Response({
-            'error': 'schedule_day_id is required'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    if not isinstance(user_ids, list):
-        return Response({
-            'error': 'user_ids must be a list'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    try:
-        schedule_day = ScheduleDay.objects.get(id=schedule_day_id)
-    except ScheduleDay.DoesNotExist:
-        return Response({
-            'error': 'Schedule day not found'
-        }, status=status.HTTP_404_NOT_FOUND)
-    
-    deleted_count = UserSchedule.objects.filter(
-        schedule_day=schedule_day,
-        user_id__in=user_ids
-    ).delete()[0]
-    
-    return Response({
-        'message': f'{deleted_count} users removed from schedule',
-        'deleted_count': deleted_count
-    }, status=status.HTTP_200_OK)
 
 
 # ==================== USER SCHEDULE VIEWS ====================
@@ -401,440 +359,686 @@ def my_schedule(request):
     """
     user = request.user
     
-    # Get all schedule days with user's assignments
-    days = ScheduleDay.objects.all().order_by('day_name')
+    # Get date range (default: next 30 days)
+    start_date = request.query_params.get('start_date', timezone.now().date().isoformat())
+    end_date = request.query_params.get('end_date', 
+                                       (timezone.now() + timedelta(days=30)).date().isoformat())
     
-    weekly_schedule = []
-    for day in days:
-        user_assignment = day.user_schedules.filter(user=user).first()
-        weekly_schedule.append({
-            'day': day.day_name,
-            'has_assignment': user_assignment is not None,
-            'schedule_day': ScheduleDaySerializer(day, context={'request': request}).data if user_assignment else None
-        })
+    try:
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    except ValueError:
+        return Response({
+            'error': INVALID_DATE_FORMAT_ERROR
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Get events
+    events = ScheduleEvent.objects.filter(
+        user=user,
+        start_date__lte=end_date,
+        end_date__gte=start_date,
+        status__in=['scheduled', 'confirmed']
+    ).select_related('shift', 'patient').order_by('start_date', 'start_time')
+    
+    serializer = ScheduleEventSerializer(events, many=True, context={'request': request})
+    
+    # Get today's events
+    today = timezone.now().date()
+    today_events = events.filter(start_date__lte=today, end_date__gte=today)
+    
+    # Get upcoming events
+    upcoming_events = events.filter(start_date__gt=today)
+    
+    # Calculate total hours
+    total_hours = sum(event.duration_hours for event in events)
     
     return Response({
-        'user_id': str(user.id),
-        'user_name': user.get_full_name(),
-        'weekly_schedule': weekly_schedule
+        'user': {
+            'id': str(user.id),
+            'name': user.get_full_name(),
+            'email': user.email
+        },
+        'date_range': {
+            'start': start_date.isoformat(),
+            'end': end_date.isoformat()
+        },
+        'today': {
+            'date': today.isoformat(),
+            'events': ScheduleEventSerializer(today_events, many=True, context={'request': request}).data,
+            'count': today_events.count()
+        },
+        'upcoming': {
+            'events': ScheduleEventSerializer(upcoming_events, many=True, context={'request': request}).data,
+            'count': upcoming_events.count()
+        },
+        'all_events': serializer.data,
+        'total_events': events.count(),
+        'total_hours': round(total_hours, 2)
     }, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-def user_weekly_schedule(request, user_id=None):
+def my_upcoming_shifts(request):
     """
-    Get a user's complete weekly schedule
+    Get current user's upcoming shifts
     """
-    if user_id:
-        user = get_object_or_404(User, id=user_id)
-    else:
-        user = request.user
+    user = request.user
+    today = timezone.now().date()
     
-    # Check permissions - users can see their own schedule, admins can see anyone's
-    if user != request.user and not request.user.is_staff:
+    shifts = ScheduleEvent.objects.filter(
+        user=user,
+        end_date__gte=today,
+        event_type='shift',
+        status__in=['scheduled', 'confirmed']
+    ).select_related('shift').order_by('start_date', 'start_time')
+    
+    # Limit to 20 shifts
+    shifts = shifts[:20]
+    
+    serializer = ScheduleEventSerializer(shifts, many=True, context={'request': request})
+    
+    # Get next shift
+    next_shift = shifts.first() if shifts.exists() else None
+    
+    return Response({
+        'user_id': str(user.id),
+        'user_name': user.get_full_name(),
+        'shifts': serializer.data,
+        'count': shifts.count(),
+        'next_shift': ScheduleEventSerializer(next_shift).data if next_shift else None
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def user_schedule_view(request, user_id):
+    """
+    Get a user's schedule (admin can view any user, users can only view their own)
+    """
+    if user_id != str(request.user.id) and not request.user.is_staff:
         return Response({
             'error': 'You can only view your own schedule'
         }, status=status.HTTP_403_FORBIDDEN)
     
-    serializer = UserWeeklyScheduleSerializer(user, context={'request': request})
+    user = get_object_or_404(User, id=user_id)
+    
+    # Get date range from query params or default to next 30 days
+    start_date = request.query_params.get('start_date', timezone.now().date().isoformat())
+    end_date = request.query_params.get('end_date', 
+                                       (timezone.now() + timedelta(days=30)).date().isoformat())
+    
+    try:
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    except ValueError:
+        return Response({
+            'error': INVALID_DATE_FORMAT_ERROR
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    events = ScheduleEvent.objects.filter(
+        user=user,
+        start_date__lte=end_date,
+        end_date__gte=start_date,
+        status__in=['scheduled', 'confirmed']
+    ).select_related('shift', 'patient').order_by('start_date', 'start_time')
+    
+    serializer = ScheduleEventSerializer(events, many=True, context={'request': request})
+    
+    # Calculate statistics
+    total_hours = sum(event.duration_hours for event in events)
+    shift_events = events.filter(event_type='shift')
+    shift_hours = sum(event.duration_hours for event in shift_events)
     
     return Response({
-        'user_id': str(user.id),
-        'user_name': user.get_full_name(),
-        'weekly_schedule': serializer.data['weekly_schedule']
+        'user': {
+            'id': str(user.id),
+            'name': user.get_full_name(),
+            'email': user.email,
+            'department': user.department if hasattr(user, 'department') else ''
+        },
+        'date_range': {
+            'start': start_date.isoformat(),
+            'end': end_date.isoformat()
+        },
+        'events': serializer.data,
+        'total_events': events.count(),
+        'shift_events': shift_events.count(),
+        'total_hours': round(total_hours, 2),
+        'shift_hours': round(shift_hours, 2)
+    }, status=status.HTTP_200_OK)
+
+
+# ==================== CALENDAR VIEWS ====================
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def calendar_view(request):
+    """
+    Calendar view with different view types (month, week, day)
+    """
+    view_type = request.query_params.get('view', 'month')  # month, week, day
+    date_str = request.query_params.get('date', timezone.now().date().isoformat())
+    
+    try:
+        current_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        current_date = timezone.now().date()
+    
+    # Determine date range based on view type
+    if view_type == 'month':
+        start_date = current_date.replace(day=1)
+        if start_date.month == 12:
+            next_month = start_date.replace(year=start_date.year + 1, month=1)
+        else:
+            next_month = start_date.replace(month=start_date.month + 1)
+        end_date = next_month - timedelta(days=1)
+    elif view_type == 'week':
+        start_date = current_date - timedelta(days=current_date.weekday())
+        end_date = start_date + timedelta(days=6)
+    else:  # day
+        start_date = current_date
+        end_date = current_date
+    
+    # Get events for current user
+    events = ScheduleEvent.objects.filter(
+        user=request.user,
+        start_date__lte=end_date,
+        end_date__gte=start_date,
+        status__in=['scheduled', 'confirmed']
+    ).select_related('shift').order_by('start_date', 'start_time')
+    
+    serializer = ScheduleEventSerializer(events, many=True, context={'request': request})
+    
+    # Group events by date for easier frontend rendering
+    events_by_date = {}
+    for event in events:
+        date_key = event.start_date.isoformat()
+        if date_key not in events_by_date:
+            events_by_date[date_key] = []
+        events_by_date[date_key].append(ScheduleEventSerializer(event, context={'request': request}).data)
+    
+    return Response({
+        'view_type': view_type,
+        'current_date': current_date.isoformat(),
+        'date_range': {
+            'start': start_date.isoformat(),
+            'end': end_date.isoformat()
+        },
+        'events': serializer.data,
+        'events_by_date': events_by_date
+    }, status=status.HTTP_200_OK)
+
+
+# ==================== DEPARTMENT SCHEDULE VIEWS ====================
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def department_schedule(request, department):
+    """
+    Get schedule for a specific department
+    """
+    # Check if user has access to this department
+    user = request.user
+    if not user.is_staff and (not hasattr(user, 'department') or user.department != department):
+        return Response({
+            'error': 'You do not have access to this department schedule'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    # Get date range
+    start_date = request.query_params.get('start_date', timezone.now().date().isoformat())
+    end_date = request.query_params.get('end_date', 
+                                       (timezone.now() + timedelta(days=7)).date().isoformat())
+    
+    try:
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    except ValueError:
+        return Response({
+            'error': INVALID_DATE_FORMAT_ERROR
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Get users in department
+    users = User.objects.filter(
+        department=department,
+        is_active=True
+    )
+    
+    # Get events for these users
+    events = ScheduleEvent.objects.filter(
+        user__in=users,
+        start_date__lte=end_date,
+        end_date__gte=start_date,
+        status__in=['scheduled', 'confirmed']
+    ).select_related('user', 'shift').order_by('start_date', 'start_time')
+    
+    # Group by date
+    schedule_by_date = {}
+    for event in events:
+        date_str = event.start_date.isoformat()
+        if date_str not in schedule_by_date:
+            schedule_by_date[date_str] = {
+                'date': event.start_date.isoformat(),
+                'events': []
+            }
+        
+        schedule_by_date[date_str]['events'].append(
+            ScheduleEventSerializer(event, context={'request': request}).data
+        )
+    
+    # Convert to list and sort by date
+    schedule_list = sorted(schedule_by_date.values(), key=lambda x: x['date'])
+    
+    return Response({
+        'department': department,
+        'date_range': {
+            'start': start_date.isoformat(),
+            'end': end_date.isoformat()
+        },
+        'total_users': users.count(),
+        'schedule': schedule_list
     }, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-def today_schedule(request):
+def department_today(request, department):
     """
-    Get today's schedule for current user
+    Get today's schedule for a department
     """
+    # Check if user has access to this department
     user = request.user
-    today = timezone.now().strftime('%A')  # Get day name
-    
-    try:
-        schedule_day = ScheduleDay.objects.get(day_name=today)
-        user_assignment = schedule_day.user_schedules.filter(user=user).first()
-        
-        if user_assignment:
-            return Response({
-                'today': today,
-                'has_shift': True,
-                'schedule': ScheduleDaySerializer(schedule_day, context={'request': request}).data
-            }, status=status.HTTP_200_OK)
-        else:
-            return Response({
-                'today': today,
-                'has_shift': False,
-                'message': 'No shift scheduled for today'
-            }, status=status.HTTP_200_OK)
-            
-    except ScheduleDay.DoesNotExist:
+    if not user.is_staff and (not hasattr(user, 'department') or user.department != department):
         return Response({
-            'today': today,
-            'has_shift': False,
-            'message': 'No schedule defined for today'
+            'error': 'You do not have access to this department schedule'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    today = timezone.now().date()
+    
+    # Get users in department
+    users = User.objects.filter(
+        department=department,
+        is_active=True
+    )
+    
+    # Get today's events
+    events = ScheduleEvent.objects.filter(
+        user__in=users,
+        start_date__lte=today,
+        end_date__gte=today,
+        status__in=['scheduled', 'confirmed']
+    ).select_related('user', 'shift').order_by('start_time')
+    
+    serializer = ScheduleEventSerializer(events, many=True, context={'request': request})
+    
+    # Group by event type
+    events_by_type = {}
+    for event in events:
+        event_type = event.event_type
+        if event_type not in events_by_type:
+            events_by_type[event_type] = []
+        events_by_type[event_type].append(
+            ScheduleEventSerializer(event, context={'request': request}).data
+        )
+    
+    return Response({
+        'department': department,
+        'date': today.isoformat(),
+        'total_events': events.count(),
+        'total_users': users.count(),
+        'users_on_duty': events.values('user').distinct().count(),
+        'events': serializer.data,
+        'events_by_type': events_by_type
+    }, status=status.HTTP_200_OK)
+
+
+# ==================== SCHEDULE TEMPLATE VIEWS ====================
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def schedule_template_list(request):
+    """
+    List all schedule templates
+    """
+    templates = ScheduleTemplate.objects.prefetch_related('days__shift')
+    
+    # Apply filters
+    department = request.query_params.get('department')
+    is_active = request.query_params.get('is_active')
+    
+    if department:
+        templates = templates.filter(department=department)
+    
+    if is_active and is_active.lower() in ['true', 'false']:
+        templates = templates.filter(is_active=is_active.lower() == 'true')
+    
+    serializer = ScheduleTemplateSerializer(templates, many=True, context={'request': request})
+    
+    return Response({
+        'count': templates.count(),
+        'templates': serializer.data
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def create_schedule_template(request):
+    """
+    Create a new schedule template (admin only)
+    """
+    serializer = ScheduleTemplateSerializer(data=request.data, context={'request': request})
+    
+    if serializer.is_valid():
+        serializer.save()
+        
+        return Response({
+            'message': 'Schedule template created successfully',
+            'template': serializer.data
+        }, status=status.HTTP_201_CREATED)
+    
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def schedule_template_detail(request, template_id):
+    """
+    Retrieve, update, or delete a schedule template
+    """
+    template = get_object_or_404(
+        ScheduleTemplate.objects.prefetch_related('days__shift'),
+        id=template_id
+    )
+    
+    if request.method == 'GET':
+        serializer = ScheduleTemplateSerializer(template, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    elif request.method in ['PUT', 'PATCH']:
+        if not request.user.is_staff:
+            return Response({
+                'error': 'Only administrators can update schedule templates'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        partial = request.method == 'PATCH'
+        serializer = ScheduleTemplateSerializer(template, data=request.data, partial=partial, context={'request': request})
+        
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                'message': 'Schedule template updated successfully',
+                'template': serializer.data
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    elif request.method == 'DELETE':
+        if not request.user.is_staff:
+            return Response({
+                'error': 'Only administrators can delete schedule templates'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        template.delete()
+        return Response({
+            'message': 'Schedule template deleted successfully'
         }, status=status.HTTP_200_OK)
 
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def upcoming_shifts(request):
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def apply_schedule_template(request, template_id):
     """
-    Get upcoming shifts for current user
+    Apply a schedule template to create actual schedule events
     """
-    user = request.user
-    
-    # Get all days with user assignments
-    user_assignments = UserSchedule.objects.filter(
-        user=user
-    ).select_related('schedule_day', 'schedule_day__shift')
-    
-    # Map day names to numbers for sorting
-    day_order = {
-        'Monday': 0,
-        'Tuesday': 1,
-        'Wednesday': 2,
-        'Thursday': 3,
-        'Friday': 4,
-        'Saturday': 5,
-        'Sunday': 6
-    }
-    
-    # Sort by day order
-    sorted_assignments = sorted(
-        user_assignments,
-        key=lambda x: day_order.get(x.schedule_day.day_name, 7)
+    start_date, user_ids, error_response = validate_apply_template_request(request)
+    if error_response:
+        return error_response
+
+    created_events, skipped_users = process_template_application(template_id, start_date, user_ids, request.user)
+
+    return Response({
+        'message': f'Template applied. {len(created_events)} events created.',
+        'created_count': len(created_events),
+        'skipped_count': len(skipped_users),
+        'created_events': created_events,
+        'skipped_users': skipped_users
+    }, status=status.HTTP_200_OK)
+
+def validate_apply_template_request(request):
+    start_date = request.data.get('start_date')
+    user_ids = request.data.get('user_ids', [])
+
+    if not start_date:
+        return None, None, Response({'error': 'start_date is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+    except ValueError:
+        return None, None, Response({'error': 'Invalid date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not isinstance(user_ids, list) or len(user_ids) == 0:
+        return None, None, Response({'error': 'user_ids must be a non-empty list'}, status=status.HTTP_400_BAD_REQUEST)
+
+    return start_date, user_ids, None
+
+def process_template_application(template_id, start_date, user_ids, created_by):
+    template = get_object_or_404(ScheduleTemplate, id=template_id)
+    created_events = []
+    skipped_users = []
+
+    with transaction.atomic():
+        for user_id in user_ids:
+            user = get_object_or_404(User, id=user_id)
+            process_user_template_days(template, user, start_date, created_by, created_events, skipped_users)
+
+    return created_events, skipped_users
+
+def process_user_template_days(template, user, start_date, created_by, created_events, skipped_users):
+    for template_day in template.days.all():
+        if template_day.shift:
+            event_date = calculate_event_date(template_day, start_date)
+            if check_schedule_conflicts(user, event_date):
+                skipped_users.append({
+                    'user_id': str(user.id),
+                    'user_name': user.get_full_name(),
+                    'date': event_date.isoformat(),
+                    'reason': 'Schedule conflict'
+                })
+                continue
+
+            create_schedule_event(template_day, user, event_date, created_by, created_events)
+
+def calculate_event_date(template_day, start_date):
+    days_to_add = (template_day.day_of_week - start_date.weekday()) % 7
+    return start_date + timedelta(days=days_to_add)
+
+def check_schedule_conflicts(user, event_date):
+    return ScheduleEvent.objects.filter(
+        user=user,
+        status__in=['scheduled', 'confirmed'],
+        start_date__lte=event_date,
+        end_date__gte=event_date
+    ).exists()
+
+def create_schedule_event(template_day, user, event_date, created_by, created_events):
+    event = ScheduleEvent.objects.create(
+        user=user,
+        title=f"{template_day.shift.name} - {user.get_full_name()}",
+        event_type='shift',
+        start_date=event_date,
+        end_date=event_date,
+        start_time=template_day.shift.start_time,
+        end_time=template_day.shift.end_time,
+        shift=template_day.shift,
+        status='scheduled',
+        department=user.department if hasattr(user, 'department') else '',
+        created_by=created_by
     )
-    
-    # Get current day
-    today = timezone.now().strftime('%A')
-    today_order = day_order.get(today, 7)
-    
-    # Filter upcoming shifts (including today)
-    upcoming = []
-    for assignment in sorted_assignments:
-        day_order_num = day_order.get(assignment.schedule_day.day_name, 7)
-        if day_order_num >= today_order and assignment.schedule_day.shift:
-            upcoming.append({
-                'day': assignment.schedule_day.day_name,
-                'shift': ShiftSerializer(assignment.schedule_day.shift).data,
-                'schedule_day_id': str(assignment.schedule_day.id)
-            })
-    
-    return Response({
-        'user_id': str(user.id),
-        'user_name': user.get_full_name(),
-        'today': today,
-        'upcoming_shifts': upcoming,
-        'count': len(upcoming)
-    }, status=status.HTTP_200_OK)
+    created_events.append(ScheduleEventSerializer(event, context={'request': None}).data)
 
-
-# ==================== DEPARTMENT & TEAM SCHEDULE VIEWS ====================
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def department_schedule(request):
-    """
-    Get schedule for users in the same department
-    """
-    user = request.user
-    
-    if not user.department:
-        return Response({
-            'error': 'You are not assigned to any department'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Get all users in the same department
-    department_users = User.objects.filter(department=user.department, is_active=True)
-    
-    # Get all schedule days
-    days = ScheduleDay.objects.all().order_by('day_name')
-    
-    department_schedule = []
-    for day in days:
-        day_assignments = day.user_schedules.filter(user__in=department_users).select_related('user')
-        
-        if day_assignments.exists():
-            users_on_shift = [assignment.user for assignment in day_assignments]
-            department_schedule.append({
-                'day': day.day_name,
-                'has_shift': day.shift is not None,
-                'shift': ShiftSerializer(day.shift).data if day.shift else None,
-                'assigned_users': [
-                    {
-                        'id': str(user.id),
-                        'name': user.get_full_name(),
-                        'email': user.email
-                    } for user in users_on_shift
-                ],
-                'assigned_count': len(users_on_shift)
-            })
-    
-    return Response({
-        'department': user.department,
-        'schedule': department_schedule
-    }, status=status.HTTP_200_OK)
-
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def day_schedule_detail(request, day_id):
-    """
-    Get detailed schedule for a specific day
-    """
-    day = get_object_or_404(
-        ScheduleDay.objects.select_related('shift').prefetch_related('user_schedules__user'),
-        id=day_id
-    )
-    
-    serializer = DayScheduleSerializer(day, context={'request': request})
-    
-    return Response({
-        'day': day.day_name,
-        'schedule': serializer.data
-    }, status=status.HTTP_200_OK)
-
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def available_users_for_day(request, day_id):
-    """
-    Get users not assigned to a specific day
-    """
-    day = get_object_or_404(ScheduleDay, id=day_id)
-    
-    # Get users already assigned to this day
-    assigned_user_ids = day.user_schedules.values_list('user_id', flat=True)
-    
-    # Get available users (not assigned and active)
-    available_users = User.objects.filter(
-        is_active=True
-    ).exclude(
-        id__in=assigned_user_ids
-    ).order_by('first_name', 'last_name')
-    
-    # Apply department filter if provided
-    department = request.query_params.get('department')
-    if department:
-        available_users = available_users.filter(department=department)
-    
-    from users.serializers import UserMinimalSerializer
-    serializer = UserMinimalSerializer(available_users, many=True, context={'request': request})
-    
-    return Response({
-        'day': day.day_name,
-        'available_users': serializer.data,
-        'count': available_users.count()
-    }, status=status.HTTP_200_OK)
-
-
-# ==================== SCHEDULE CONFLICT CHECKING ====================
+# ==================== AVAILABILITY & CONFLICT CHECKING ====================
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
-def check_schedule_conflicts(request):
+def check_availability(request):
     """
-    Check for schedule conflicts for multiple users
+    Check user availability for given dates
     """
     user_ids = request.data.get('user_ids', [])
-    schedule_day_ids = request.data.get('schedule_day_ids', [])
+    start_date = request.data.get('start_date')
+    end_date = request.data.get('end_date')
     
-    if not isinstance(user_ids, list) or not isinstance(schedule_day_ids, list):
+    if not user_ids or not start_date or not end_date:
         return Response({
-            'error': 'user_ids and schedule_day_ids must be lists'
+            'error': 'user_ids, start_date, and end_date are required'
         }, status=status.HTTP_400_BAD_REQUEST)
     
-    if not user_ids or not schedule_day_ids:
+    try:
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    except ValueError:
         return Response({
-            'error': 'Both user_ids and schedule_day_ids are required'
+            'error': INVALID_DATE_FORMAT_ERROR
         }, status=status.HTTP_400_BAD_REQUEST)
     
-    conflicts = []
+    if not isinstance(user_ids, list):
+        return Response({
+            'error': 'user_ids must be a list'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    availability_results = []
     
     for user_id in user_ids:
-        for day_id in schedule_day_ids:
-            # Check if assignment already exists
-            if UserSchedule.objects.filter(user_id=user_id, schedule_day_id=day_id).exists():
-                try:
-                    user = User.objects.get(id=user_id)
-                    day = ScheduleDay.objects.get(id=day_id)
-                    
-                    conflicts.append({
-                        'user_id': user_id,
-                        'user_name': user.get_full_name(),
-                        'day_id': day_id,
-                        'day_name': day.day_name,
-                        'conflict': 'User already assigned to this day'
-                    })
-                except (User.DoesNotExist, ScheduleDay.DoesNotExist):
-                    pass
-    
-    return Response({
-        'has_conflicts': len(conflicts) > 0,
-        'conflicts': conflicts,
-        'conflict_count': len(conflicts)
-    }, status=status.HTTP_200_OK)
-
-
-# ==================== SCHEDULE GENERATION & TEMPLATES ====================
-@api_view(['POST'])
-@permission_classes([IsAdminUser])
-def generate_weekly_schedule(request):
-    """
-    Generate a weekly schedule based on a template
-    """
-    template_name = request.data.get('template_name', 'Default Weekly Schedule')
-    
-    # Days of the week
-    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-    
-    created_days = []
-    
-    for day_name in days:
-        # Check if day already exists
-        if not ScheduleDay.objects.filter(day_name=day_name).exists():
-            day = ScheduleDay.objects.create(day_name=day_name)
-            created_days.append({
-                'day': day.day_name,
-                'id': str(day.id)
+        try:
+            user = User.objects.get(id=user_id)
+            
+            # Check for existing events in this date range
+            conflicts = ScheduleEvent.objects.filter(
+                user=user,
+                status__in=['scheduled', 'confirmed'],
+                start_date__lte=end_date,
+                end_date__gte=start_date
+            )
+            
+            availability_results.append({
+                'user_id': str(user.id),
+                'user_name': user.get_full_name(),
+                'is_available': not conflicts.exists(),
+                'conflicts': ScheduleEventSerializer(conflicts, many=True, context={'request': request}).data if conflicts.exists() else [],
+                'conflict_count': conflicts.count()
+            })
+            
+        except User.DoesNotExist:
+            availability_results.append({
+                'user_id': user_id,
+                'user_name': 'Unknown',
+                'is_available': False,
+                'conflicts': [],
+                'conflict_count': 0,
+                'error': 'User not found'
             })
     
     return Response({
-        'message': f'Weekly schedule template "{template_name}" created',
-        'created_days': created_days,
-        'total_created': len(created_days)
-    }, status=status.HTTP_201_CREATED)
-
-
-@api_view(['POST'])
-@permission_classes([IsAdminUser])
-def copy_schedule_week(request):
-    """
-    Copy schedule assignments from one week to another
-    """
-    source_day_ids = request.data.get('source_day_ids', [])
-    target_day_ids = request.data.get('target_day_ids', [])
-    
-    if not isinstance(source_day_ids, list) or not isinstance(target_day_ids, list):
-        return Response({
-            'error': 'source_day_ids and target_day_ids must be lists'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    if len(source_day_ids) != len(target_day_ids):
-        return Response({
-            'error': 'source_day_ids and target_day_ids must have the same length'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    copied_count = 0
-    
-    for source_id, target_id in zip(source_day_ids, target_day_ids):
-        try:
-            source_day = ScheduleDay.objects.get(id=source_id)
-            target_day = ScheduleDay.objects.get(id=target_id)
-            
-            # Get all assignments from source day
-            source_assignments = UserSchedule.objects.filter(schedule_day=source_day)
-            
-            # Copy assignments to target day
-            for assignment in source_assignments:
-                # Check if assignment already exists in target day
-                if not UserSchedule.objects.filter(
-                    user=assignment.user,
-                    schedule_day=target_day
-                ).exists():
-                    UserSchedule.objects.create(
-                        user=assignment.user,
-                        schedule_day=target_day
-                    )
-                    copied_count += 1
-            
-            # Copy shift assignment if exists
-            if source_day.shift and not target_day.shift:
-                target_day.shift = source_day.shift
-                target_day.save()
-                
-        except ScheduleDay.DoesNotExist:
-            continue
-    
-    return Response({
-        'message': f'{copied_count} schedule assignments copied',
-        'copied_count': copied_count
+        'date_range': {
+            'start': start_date.isoformat(),
+            'end': end_date.isoformat()
+        },
+        'results': availability_results
     }, status=status.HTTP_200_OK)
 
 
-# ==================== STATISTICS & REPORTS ====================
-@api_view(['GET'])
+@api_view(['POST'])
 @permission_classes([IsAuthenticated])
-def schedule_statistics(request):
+def check_conflicts(request):
     """
-    Get schedule statistics
+    Check for schedule conflicts
     """
-    if not request.user.is_staff:
+    user_id = request.data.get('user_id')
+    start_date = request.data.get('start_date')
+    end_date = request.data.get('end_date')
+    event_id = request.data.get('event_id')  # For updates, exclude current event
+    
+    if not user_id or not start_date or not end_date:
         return Response({
-            'error': 'Only administrators can view schedule statistics'
-        }, status=status.HTTP_403_FORBIDDEN)
+            'error': 'user_id, start_date, and end_date are required'
+        }, status=status.HTTP_400_BAD_REQUEST)
     
-    # Total counts
-    total_shifts = Shift.objects.count()
-    total_schedule_days = ScheduleDay.objects.count()
-    total_assignments = UserSchedule.objects.count()
+    try:
+        user = User.objects.get(id=user_id)
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    except (User.DoesNotExist, ValueError):
+        return Response({
+            'error': 'Invalid user_id or date format'
+        }, status=status.HTTP_400_BAD_REQUEST)
     
-    # Users with assignments
-    users_with_assignments = User.objects.filter(
-        schedules__isnull=False
-    ).distinct().count()
+    # Check for conflicts
+    conflicts = ScheduleEvent.objects.filter(
+        user=user,
+        status__in=['scheduled', 'confirmed'],
+        start_date__lte=end_date,
+        end_date__gte=start_date
+    )
     
-    total_users = User.objects.filter(is_active=True).count()
+    if event_id:
+        conflicts = conflicts.exclude(id=event_id)
     
-    # Schedule days by shift assignment
-    days_with_shift = ScheduleDay.objects.filter(shift__isnull=False).count()
-    days_without_shift = ScheduleDay.objects.filter(shift__isnull=True).count()
-    
-    # Most assigned users
-    from django.db.models import Count
-    most_assigned_users = User.objects.filter(
-        schedules__isnull=False
-    ).annotate(
-        assignment_count=Count('schedules')
-    ).order_by('-assignment_count')[:10]
-    
-    most_assigned_data = []
-    for user in most_assigned_users:
-        most_assigned_data.append({
-            'id': str(user.id),
-            'name': user.get_full_name(),
-            'department': user.department,
-            'assignment_count': user.assignment_count
-        })
-    
-    # Days with most assignments
-    days_most_assignments = ScheduleDay.objects.annotate(
-        assignment_count=Count('user_schedules')
-    ).order_by('-assignment_count')[:5]
-    
-    days_most_data = []
-    for day in days_most_assignments:
-        days_most_data.append({
-            'id': str(day.id),
-            'day': day.day_name,
-            'has_shift': day.shift is not None,
-            'assignment_count': day.assignment_count
-        })
+    serializer = ScheduleEventSerializer(conflicts, many=True, context={'request': request})
     
     return Response({
+        'has_conflicts': conflicts.exists(),
+        'conflict_count': conflicts.count(),
+        'conflicts': serializer.data
+    }, status=status.HTTP_200_OK)
+
+
+# ==================== STATISTICS VIEWS ====================
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def schedule_statistics(request):
+    """
+    Get system-wide schedule statistics (admin only)
+    """
+    today = timezone.now().date()
+    
+    # Basic counts
+    total_events = ScheduleEvent.objects.count()
+    total_shifts = ScheduleEvent.objects.filter(event_type='shift').count()
+    upcoming_events = ScheduleEvent.objects.filter(end_date__gte=today).count()
+    
+    # Events by type
+    events_by_type = ScheduleEvent.objects.values('event_type').annotate(
+        count=Count('id')
+    ).order_by('-count')
+    
+    # Events by status
+    events_by_status = ScheduleEvent.objects.values('status').annotate(
+        count=Count('id')
+    ).order_by('-count')
+    
+    # Users with most events
+    busy_users = User.objects.annotate(
+        event_count=Count('schedule_events')
+    ).order_by('-event_count')[:10]
+    
+    busy_users_data = []
+    for user in busy_users:
+        busy_users_data.append({
+            'id': str(user.id),
+            'name': user.get_full_name(),
+            'event_count': user.event_count
+        })
+    
+    # Department statistics
+    department_stats = ScheduleEvent.objects.exclude(department='').values('department').annotate(
+        event_count=Count('id'),
+        user_count=Count('user', distinct=True)
+    ).order_by('-event_count')[:10]
+    
+    return Response({
+        'total_events': total_events,
         'total_shifts': total_shifts,
-        'total_schedule_days': total_schedule_days,
-        'total_assignments': total_assignments,
-        'users_with_assignments': users_with_assignments,
-        'total_active_users': total_users,
-        'coverage_percentage': round((users_with_assignments / total_users * 100), 2) if total_users > 0 else 0,
-        'days_with_shift': days_with_shift,
-        'days_without_shift': days_without_shift,
-        'most_assigned_users': most_assigned_data,
-        'days_most_assignments': days_most_data
+        'upcoming_events': upcoming_events,
+        'events_by_type': list(events_by_type),
+        'events_by_status': list(events_by_status),
+        'busiest_users': busy_users_data,
+        'department_stats': list(department_stats)
     }, status=status.HTTP_200_OK)
 
 
@@ -842,50 +1046,216 @@ def schedule_statistics(request):
 @permission_classes([IsAuthenticated])
 def user_schedule_statistics(request, user_id=None):
     """
-    Get schedule statistics for a specific user
+    Get schedule statistics for a user
     """
     if user_id:
         user = get_object_or_404(User, id=user_id)
+        # Check permissions
+        if user != request.user and not request.user.is_staff:
+            return Response({
+                'error': 'You can only view your own schedule statistics'
+            }, status=status.HTTP_403_FORBIDDEN)
     else:
         user = request.user
     
-    # Check permissions
-    if user != request.user and not request.user.is_staff:
-        return Response({
-            'error': 'You can only view your own schedule statistics'
-        }, status=status.HTTP_403_FORBIDDEN)
+    today = timezone.now().date()
     
-    total_assignments = user.schedules.count()
+    # Monthly statistics (current month)
+    start_of_month = today.replace(day=1)
+    if today.month == 12:
+        end_of_month = today.replace(year=today.year + 1, month=1, day=1) - timedelta(days=1)
+    else:
+        end_of_month = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
     
-    # Days with assignments
-    assigned_days = user.schedules.values_list('schedule_day__day_name', flat=True)
+    monthly_events = ScheduleEvent.objects.filter(
+        user=user,
+        start_date__gte=start_of_month,
+        end_date__lte=end_of_month,
+        status__in=['scheduled', 'confirmed']
+    )
     
-    # Calculate weekly hours
-    weekly_hours = 0
-    for assignment in user.schedules.select_related('schedule_day__shift'):
-        if assignment.schedule_day.shift:
-            start = assignment.schedule_day.shift.start_time
-            end = assignment.schedule_day.shift.end_time
-            
-            # Calculate duration (handle overnight shifts)
-            if end < start:
-                # Overnight shift - calculate hours past midnight
-                duration = ((24 * 3600) - (start.hour * 3600 + start.minute * 60 + start.second) +
-                           (end.hour * 3600 + end.minute * 60 + end.second)) / 3600
-            else:
-                duration = (end.hour * 3600 + end.minute * 60 + end.second -
-                           (start.hour * 3600 + start.minute * 60 + start.second)) / 3600
-            
-            weekly_hours += duration
+    # Weekly statistics
+    start_of_week = today - timedelta(days=today.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+    
+    weekly_events = ScheduleEvent.objects.filter(
+        user=user,
+        start_date__gte=start_of_week,
+        end_date__lte=end_of_week,
+        status__in=['scheduled', 'confirmed']
+    )
+    
+    # Calculate hours
+    monthly_hours = sum(event.duration_hours for event in monthly_events)
+    weekly_hours = sum(event.duration_hours for event in weekly_events)
+    
+    # Events by type
+    events_by_type = ScheduleEvent.objects.filter(user=user).values('event_type').annotate(
+        count=Count('id')
+    ).order_by('-count')
     
     return Response({
-        'user_id': str(user.id),
-        'user_name': user.get_full_name(),
-        'total_assignments': total_assignments,
-        'assigned_days': list(assigned_days),
-        'weekly_hours': round(weekly_hours, 2),
-        'average_daily_hours': round(weekly_hours / max(len(assigned_days), 1), 2)
+        'user': {
+            'id': str(user.id),
+            'name': user.get_full_name()
+        },
+        'monthly': {
+            'period': {
+                'start': start_of_month.isoformat(),
+                'end': end_of_month.isoformat()
+            },
+            'total_events': monthly_events.count(),
+            'total_hours': round(monthly_hours, 2)
+        },
+        'weekly': {
+            'period': {
+                'start': start_of_week.isoformat(),
+                'end': end_of_week.isoformat()
+            },
+            'total_events': weekly_events.count(),
+            'total_hours': round(weekly_hours, 2)
+        },
+        'events_by_type': list(events_by_type)
     }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def department_statistics(request, department):
+    """
+    Get statistics for a department
+    """
+    # Check if user has access
+    user = request.user
+    if not user.is_staff and (not hasattr(user, 'department') or user.department != department):
+        return Response({
+            'error': 'You do not have access to this department statistics'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    today = timezone.now().date()
+    
+    # Get users in department
+    users = User.objects.filter(department=department, is_active=True)
+    
+    # Current week events
+    start_of_week = today - timedelta(days=today.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+    
+    weekly_events = ScheduleEvent.objects.filter(
+        user__in=users,
+        start_date__gte=start_of_week,
+        end_date__lte=end_of_week,
+        status__in=['scheduled', 'confirmed']
+    )
+    
+    # Today's events
+    today_events = ScheduleEvent.objects.filter(
+        user__in=users,
+        start_date__lte=today,
+        end_date__gte=today,
+        status__in=['scheduled', 'confirmed']
+    )
+    
+    # Calculate statistics
+    weekly_hours = sum(event.duration_hours for event in weekly_events)
+    users_on_duty_today = today_events.values('user').distinct().count()
+    
+    # Events by type for the week
+    events_by_type = weekly_events.values('event_type').annotate(
+        count=Count('id')
+    ).order_by('-count')
+    
+    return Response({
+        'department': department,
+        'total_users': users.count(),
+        'weekly': {
+            'period': {
+                'start': start_of_week.isoformat(),
+                'end': end_of_week.isoformat()
+            },
+            'total_events': weekly_events.count(),
+            'total_hours': round(weekly_hours, 2),
+            'average_hours_per_user': round(weekly_hours / users.count(), 2) if users.count() > 0 else 0
+        },
+        'today': {
+            'date': today.isoformat(),
+            'total_events': today_events.count(),
+            'users_on_duty': users_on_duty_today,
+            'coverage_percentage': round((users_on_duty_today / users.count() * 100), 2) if users.count() > 0 else 0
+        },
+        'events_by_type': list(events_by_type)
+    }, status=status.HTTP_200_OK)
+
+
+# ==================== EXPORT VIEWS ====================
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def export_schedule(request):
+    """
+    Export schedule data
+    """
+    format_type = request.query_params.get('format', 'json')  # json, csv
+    start_date = request.query_params.get('start_date')
+    end_date = request.query_params.get('end_date')
+    user_id = request.query_params.get('user_id')
+    
+    # Base queryset
+    if user_id and request.user.is_staff:
+        events = ScheduleEvent.objects.filter(user_id=user_id)
+    else:
+        events = ScheduleEvent.objects.filter(user=request.user)
+    
+    # Apply date filters
+    if start_date:
+        try:
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+            events = events.filter(end_date__gte=start_date)
+        except ValueError:
+            pass
+    
+    if end_date:
+        try:
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+            events = events.filter(start_date__lte=end_date)
+        except ValueError:
+            pass
+    
+    events = events.select_related('user', 'shift').order_by('start_date', 'start_time')
+    
+    if format_type == 'csv':
+        # Simple CSV export
+        import csv
+        from django.http import HttpResponse
+        
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="schedule_export.csv"'
+        
+        writer = csv.writer(response)
+        writer.writerow(['Date', 'Start Time', 'End Time', 'Title', 'Event Type', 'Status', 'Location', 'Duration (hours)'])
+        
+        for event in events:
+            writer.writerow([
+                event.start_date,
+                event.start_time,
+                event.end_time,
+                event.title,
+                event.event_type,
+                event.status,
+                event.location or '',
+                event.duration_hours
+            ])
+        
+        return response
+    
+    else:  # JSON format
+        serializer = ScheduleEventSerializer(events, many=True, context={'request': request})
+        
+        return Response({
+            'format': 'json',
+            'count': events.count(),
+            'export_date': timezone.now().isoformat(),
+            'data': serializer.data
+        }, status=status.HTTP_200_OK)
 
 
 # ==================== HEALTH CHECK ====================
@@ -903,14 +1273,26 @@ def schedules_health_check(request):
             cursor.execute("SELECT COUNT(*) FROM schedules_shift")
             shift_count = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(*) FROM schedules_scheduleday")
-            day_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM schedules_scheduleevent")
+            event_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM schedules_scheduletemplate")
+            template_count = cursor.fetchone()[0]
+        
+        # Get recent activity
+        recent_events = ScheduleEvent.objects.filter(
+            created_at__gte=timezone.now() - timedelta(hours=24)
+        ).count()
         
         return Response({
             'status': 'healthy',
             'database': 'connected',
             'total_shifts': shift_count,
-            'total_schedule_days': day_count,
+            'total_events': event_count,
+            'total_templates': template_count,
+            'recent_activity': {
+                'events_last_24h': recent_events
+            },
             'timestamp': timezone.now().isoformat()
         }, status=status.HTTP_200_OK)
         

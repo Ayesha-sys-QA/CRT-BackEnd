@@ -124,13 +124,52 @@ def patient_list(request):
     }, status=status.HTTP_200_OK)
 
 
+# @api_view(['POST'])
+# @permission_classes([IsAuthenticated])
+# def create_patient(request):
+#     """
+#     Create a new patient
+#     """
+#     serializer = PatientCreateSerializer(data=request.data, context={'request': request})
+    
+#     if serializer.is_valid():
+#         with transaction.atomic():
+#             patient = serializer.save()
+            
+#             # Create PatientStats for the new patient
+#             PatientStats.objects.create(patient=patient)
+            
+#             # If primary_doctor is specified, increment their patient count
+#             if patient.primary_doctor:
+#                 try:
+#                     stats = patient.primary_doctor.stats
+#                     stats.patients += 1
+#                     stats.save()
+#                 except UserStats.DoesNotExist:
+#                     pass
+        
+#         return Response({
+#             'message': 'Patient created successfully',
+#             'patient': PatientSerializer(patient, context={'request': request}).data
+#         }, status=status.HTTP_201_CREATED)
+    
+#     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_patient(request):
     """
     Create a new patient
     """
-    serializer = PatientCreateSerializer(data=request.data, context={'request': request})
+    # Add current user as primary_doctor if not specified
+    data = request.data.copy()
+    
+    # Auto-assign current doctor if not specified
+    if 'primary_doctor' not in data and request.user.role == 'doctor':
+        data['primary_doctor'] = str(request.user.id)
+    
+    serializer = PatientCreateSerializer(data=data, context={'request': request})
     
     if serializer.is_valid():
         with transaction.atomic():
@@ -154,7 +193,6 @@ def create_patient(request):
         }, status=status.HTTP_201_CREATED)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])

@@ -42,4 +42,14 @@ urlpatterns = [
     
     # ==================== HEALTH CHECK ====================
     path('health/', views.uploads_health_check, name='uploads-health-check'),
+    
+    # 1. DICOM-specific endpoints (CRITICAL for medical imaging)
+    path('<uuid:upload_id>/dicom/metadata/', views.dicom_metadata, name='dicom-metadata'),
+    path('<uuid:upload_id>/dicom/anonymize/', views.anonymize_dicom, name='anonymize-dicom'),
+    
+    # 2. Consent management (HIPAA/GDPR requirement)
+    path('<uuid:upload_id>/consent/', views.update_consent, name='update-consent'),
+    
+    # 3. Search endpoint (Doctors need to find files quickly)
+    path('search/', views.search_uploads, name='search-uploads'),
 ]

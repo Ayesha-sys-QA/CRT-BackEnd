@@ -1,5 +1,7 @@
 from datetime import date
-from time import timezone
+import secrets
+# from time import timezone
+from django.utils import timezone
 from django.shortcuts import render
 from django.db.models import Q
 from django.contrib.auth.password_validation import validate_password
@@ -50,58 +52,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# ==================== AUTHENTICATION VIEWS ====================
-# @api_view(['POST'])
-# @permission_classes([AllowAny])
-# def check_email_login(request):
-#     """
-#     Check if user can login with email only (for first-time login)
-#     """
-#     serializer = EmailLoginSerializer(data=request.data)
-#     if serializer.is_valid():
-#         user = serializer.validated_data['user']
-        
-#         if user.first_time_login:
-#             return Response({
-#                 'first_time_login': True,
-#                 'email': user.email,
-#                 'message': 'Please set your password to complete registration.',
-#                 'user_id': str(user.id)
-#             }, status=status.HTTP_200_OK)
-        
-#         return Response({
-#             'first_time_login': False,
-#             'message': 'Password required for this account.'
-#         }, status=status.HTTP_200_OK)
-    
-#     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-# @api_view(['POST'])
-# @permission_classes([AllowAny])
-# def first_time_login(request):
-#     """
-#     Complete first-time login by setting password
-#     """
-#     serializer = FirstTimeLoginSerializer(data=request.data)
-#     if serializer.is_valid():
-#         user = serializer.save()
-        
-#         # Generate JWT tokens
-#         refresh = RefreshToken.for_user(user)
-        
-#         return Response({
-#             'message': 'Password set successfully. Account activated.',
-#             'user': UserSerializer(user).data,
-#             'tokens': {
-#                 'refresh': str(refresh),
-#                 'access': str(refresh.access_token),
-#             }
-#         }, status=status.HTTP_200_OK)
-    
-#     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def login(request):
@@ -129,9 +79,12 @@ def login(request):
         
         # Create session record (only for regular login)
         if not is_first_time:
+            # Generate a unique session ID
+            session_id = secrets.token_urlsafe(32)
             Session.objects.create(
                 user=user,
-                session_id=str(refresh.access_token),
+                # session_id=str(refresh.access_token),
+                session_id=session_id,
                 device=request.META.get('HTTP_USER_AGENT', 'Unknown'),
                 location=request.META.get('REMOTE_ADDR', 'Unknown'),
                 ip_address=request.META.get('REMOTE_ADDR'),
@@ -321,16 +274,22 @@ def user_list(request):
 # @permission_classes([IsAdminUser])
 # def create_user(request):
 #     """
-#     Create new user (admin only)
+#     Create new user (admin only) - Minimal data required
 #     """
-#     serializer = UserCreateSerializer(data=request.data)
+#     serializer = SimpleUserCreateSerializer(data=request.data)  # Use SimpleUserCreateSerializer
     
 #     if serializer.is_valid():
 #         user = serializer.save()
         
 #         return Response({
-#             'message': 'User created successfully',
-#             'user': UserSerializer(user).data
+#             'message': 'User created successfully. User must complete profile on first login.',
+#             'user': {
+#                 'id': str(user.id),
+#                 'email': user.email,
+#                 'national_id': user.national_id,
+#                 'role': user.role,
+#                 'first_time_login': user.first_time_login
+#             }
 #         }, status=status.HTTP_201_CREATED)
     
 #     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -365,7 +324,7 @@ def create_user(request):
 @permission_classes([IsAuthenticated])
 def complete_profile(request):
     """
-    Complete user profile on first login
+    Complete user profile on first login - includes password setting
     """
     user = request.user
     
@@ -374,26 +333,60 @@ def complete_profile(request):
             'error': 'Profile already completed'
         }, status=status.HTTP_400_BAD_REQUEST)
     
-    partial = request.method == 'PATCH'
-    serializer = UserUpdateSerializer(user, data=request.data, partial=partial)
+    # Check if password is included in request
+    password = request.data.get('password')
+    confirm_password = request.data.get('confirm_password')
+    
+    if password and confirm_password:
+        # Validate password
+        if password != confirm_password:
+            return Response({
+                'error': 'Passwords do not match.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            validate_password(password, user)
+        except ValidationError as e:
+            return Response({
+                'error': ' '.join(e.messages)
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Set password
+        user.set_password(password)
+    
+    elif password or confirm_password:
+        # Only one password field provided
+        return Response({
+            'error': 'Both password and confirm_password are required if setting password.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Update profile data (excluding password fields)
+    profile_data = {k: v for k, v in request.data.items() 
+                   if k not in ['password', 'confirm_password']}
+    
+    serializer = UserUpdateSerializer(user, data=profile_data, partial=True)
     
     if serializer.is_valid():
         serializer.save()
         
-        # Mark first_time_login as False if all required fields are filled
-        # Define which fields are required for profile completion
+        # Mark first_time_login as False if profile is complete
+        # Define required fields for profile completion
         required_fields = ['first_name', 'last_name', 'national_id', 'phone', 'department']
         has_all_required = all(
             getattr(user, field, None) for field in required_fields
         )
         
-        if has_all_required:
+        # Also require password to be set
+        has_password = user.has_usable_password()
+        
+        if has_all_required and has_password:
             user.first_time_login = False
             user.save()
         
         return Response({
             'message': 'Profile updated successfully',
             'profile_completed': not user.first_time_login,
+            'password_set': has_password,
             'user': UserSerializer(user).data
         }, status=status.HTTP_200_OK)
     

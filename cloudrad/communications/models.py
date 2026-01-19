@@ -60,6 +60,13 @@ class Message(models.Model):
     class Meta:
         ordering = ['-timestamp']
         db_table = 'messages'
+        indexes = [
+            models.Index(fields=['sender', 'timestamp']),
+            models.Index(fields=['recipient', 'is_read', 'timestamp']),
+            models.Index(fields=['message_type', 'timestamp']),
+            # Add this for patient-related queries if frequently used:
+            models.Index(fields=['patient', 'timestamp']),
+        ]
     
     def __str__(self):
         return f"{self.subject} - {self.sender.name}"
@@ -76,6 +83,9 @@ class Attachment(models.Model):
     
     class Meta:
         ordering = ['uploaded_at']
+        indexes = [
+            models.Index(fields=['message', 'uploaded_at']),
+        ]
     
     def __str__(self):
         return self.file_name

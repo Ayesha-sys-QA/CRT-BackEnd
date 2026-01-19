@@ -5,6 +5,8 @@ from django.shortcuts import render
 from django.shortcuts import get_object_or_404
 from django.db.models import Q, Count, Sum
 from django.db import transaction
+import pydicom
+from pydicom.errors import InvalidDicomError
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
@@ -18,9 +20,9 @@ import json
 from django.core.files.storage import default_storage
 from django.conf import settings
 
-from .models import UploadFile, ProcessingOptions
+from .models import DICOMMetadata, UploadAccessLog, UploadFile, ProcessingOptions
 from .serializers import (
-    UploadFileSerializer, UploadCreateSerializer, UploadUpdateSerializer,
+    ConsentUpdateSerializer, DICOMMetadataSerializer, UploadFileMinimalSerializer, UploadFileSerializer, UploadCreateSerializer, UploadUpdateSerializer,
     UploadStatusSerializer, PatientUploadsSerializer,
     ProcessingOptionsSerializer, ProcessingOptionsUpdateSerializer,
     ChunkedUploadSerializer
@@ -36,6 +38,8 @@ logger = logging.getLogger(__name__)
 # Define a constant for the error message
 UPLOAD_IDS_MUST_BE_LIST_ERROR = 'upload_ids must be a list'
 
+DICOM_MIME_TYPES = ['application/dicom', 'image/dicom']
+DICOM_FILE_EXTENSION = '.dcm'
 
 # ==================== UPLOAD MANAGEMENT VIEWS ====================
 @api_view(['GET'])
@@ -118,6 +122,7 @@ def upload_list(request):
     }, status=status.HTTP_200_OK)
 
 
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_upload(request):
@@ -128,11 +133,18 @@ def create_upload(request):
     
     if serializer.is_valid():
         with transaction.atomic():
-            upload = serializer.save()
+            # Get the validated data
+            validated_data = serializer.validated_data.copy()
+            
+            # ADD THIS: Set uploaded_by to current user
+            validated_data['uploaded_by'] = request.user
+            
+            # Create upload with all data including uploaded_by
+            upload = UploadFile.objects.create(**validated_data)
             
             # Set initial status
             upload.status = 'uploading'
-            upload.progress = 10  # Initial progress
+            upload.progress = 10
             upload.save()
             
             # Check if this is a chunked upload
@@ -141,13 +153,33 @@ def create_upload(request):
             total_chunks = request.data.get('total_chunks')
             
             if upload_id and chunk_index is not None and total_chunks:
-                # Handle chunked upload
                 return _handle_chunked_upload(upload, upload_id, int(chunk_index), int(total_chunks))
             
             # Handle regular single file upload
             upload.progress = 100
             upload.status = 'uploaded'
             upload.save()
+            
+            # Create processing options
+            ProcessingOptions.objects.create(upload=upload)
+            
+            # Check if it's a DICOM file and extract metadata
+            if upload.file_type in DICOM_MIME_TYPES or upload.file.name.lower().endswith(DICOM_FILE_EXTENSION):
+                try:
+                    # Try to extract DICOM metadata
+                    file_path = upload.file.path
+                    ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+                    
+                    DICOMMetadata.objects.create(
+                        upload=upload,
+                        modality=str(ds.get('Modality', '')),
+                        study_description=str(ds.get('StudyDescription', '')),
+                        series_description=str(ds.get('SeriesDescription', '')),
+                        rows=ds.get('Rows', None),
+                        columns=ds.get('Columns', None)
+                    )
+                except Exception as e:  # FIXED: Specify exception class
+                    logger.warning(f"Failed to extract DICOM metadata for upload {upload.id}: {e}")
         
         return Response({
             'message': 'File uploaded successfully',
@@ -155,6 +187,7 @@ def create_upload(request):
         }, status=status.HTTP_201_CREATED)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 
 
 def _handle_chunked_upload(upload, upload_id, chunk_index, total_chunks):
@@ -495,8 +528,22 @@ def download_file(request, upload_id):
             'error': 'File not found'
         }, status=status.HTTP_404_NOT_FOUND)
     
+    # Log download access (HIPAA requirement)
+    UploadAccessLog.objects.create(
+        upload=upload,
+        user=request.user,
+        action='downloaded',
+        ip_address=request.META.get('REMOTE_ADDR'),
+        user_agent=request.META.get('HTTP_USER_AGENT', '')
+    )
+    
+    # Update last accessed info
+    upload.last_accessed = timezone.now()
+    upload.accessed_by = request.user
+    upload.save()
+    
+    # [KEEP THE REST OF YOUR EXISTING DOWNLOAD CODE AS IS]
     try:
-        # Open the file
         file_path = upload.file.path
         if os.path.exists(file_path):
             response = FileResponse(
@@ -506,7 +553,6 @@ def download_file(request, upload_id):
             response['Content-Disposition'] = f'attachment; filename="{upload.name}{os.path.splitext(upload.file.name)[1]}"'
             response['Content-Length'] = upload.size
             
-            # Log download activity
             logger.info(f'File downloaded: {upload.name} by user {request.user.id}')
             
             return response
@@ -521,6 +567,7 @@ def download_file(request, upload_id):
             'error': 'Failed to download file',
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 
 @api_view(['GET'])
@@ -813,14 +860,17 @@ def upload_statistics(request):
         total_size=Sum('size')
     ).order_by('-count')[:10]
     
+    # ADD THIS: Uploads by category
+    uploads_by_category = UploadFile.objects.values('category').annotate(
+        count=Count('id'),
+        total_size=Sum('size')
+    ).order_by('-count')
+    
     # Recent uploads (last 7 days)
     week_ago = timezone.now() - timedelta(days=7)
     recent_uploads = UploadFile.objects.filter(
         created_at__gte=week_ago
     ).count()
-    
-    # Average file size
-    avg_file_size = total_size_bytes / total_uploads if total_uploads > 0 else 0
     
     # Format the data
     formatted_by_status = []
@@ -839,15 +889,24 @@ def upload_statistics(request):
             'total_size_mb': round(item['total_size'] / (1024 * 1024), 2) if item['total_size'] else 0
         })
     
+    # ADD THIS: Format category data
+    formatted_by_category = []
+    for item in uploads_by_category:
+        formatted_by_category.append({
+            'category': item['category'],
+            'count': item['count'],
+            'total_size_mb': round(item['total_size'] / (1024 * 1024), 2) if item['total_size'] else 0
+        })
+    
     return Response({
         'total_uploads': total_uploads,
         'total_size_gb': round(total_size_bytes / (1024 * 1024 * 1024), 2),
         'recent_uploads_7days': recent_uploads,
-        'avg_file_size_mb': round(avg_file_size / (1024 * 1024), 2),
         'uploads_by_status': formatted_by_status,
-        'uploads_by_type': formatted_by_type
+        'uploads_by_type': formatted_by_type,
+        'uploads_by_category': formatted_by_category,  # ADD THIS
+        'consented_uploads': UploadFile.objects.filter(patient_consent=True).count()  # ADD THIS
     }, status=status.HTTP_200_OK)
-
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -1039,3 +1098,266 @@ def uploads_health_check(request):
             'error': str(e),
             'timestamp': timezone.now().isoformat()
         }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        
+        
+        
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def dicom_metadata(request, upload_id):
+    """
+    Get DICOM metadata for a medical imaging file
+    """
+    upload = get_object_or_404(UploadFile, id=upload_id)
+    
+    # Check permissions
+    if not request.user.is_staff and upload.patient and upload.patient.primary_doctor != request.user:
+        return Response({
+            'error': 'You do not have permission to access this file'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    # Check if file is DICOM
+    if upload.file_type not in DICOM_MIME_TYPES and not upload.file.name.lower().endswith(DICOM_FILE_EXTENSION):
+        return Response({
+            'error': 'File is not a DICOM medical image'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        # Try to get existing metadata
+        metadata = upload.dicom_metadata
+        
+        return Response({
+            'upload_id': str(upload.id),
+            'file_name': upload.name,
+            'metadata': DICOMMetadataSerializer(metadata).data
+        }, status=status.HTTP_200_OK)
+        
+    except DICOMMetadata.DoesNotExist:
+        # Try to extract metadata from file
+        try:
+            file_path = upload.file.path
+            
+            # Read DICOM file
+            ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+            
+            # Extract basic metadata
+            dicom_metadata = DICOMMetadata.objects.create(
+                upload=upload,
+                modality=str(ds.get('Modality', '')),
+                study_description=str(ds.get('StudyDescription', '')),
+                series_description=str(ds.get('SeriesDescription', '')),
+                rows=ds.get('Rows', None),
+                columns=ds.get('Columns', None),
+                patient_name=str(ds.get('PatientName', '')),
+                patient_id=str(ds.get('PatientID', '')),
+                patient_sex=str(ds.get('PatientSex', '')),
+                study_instance_uid=str(ds.get('StudyInstanceUID', '')),
+                series_instance_uid=str(ds.get('SeriesInstanceUID', ''))
+            )
+            
+            return Response({
+                'upload_id': str(upload.id),
+                'file_name': upload.name,
+                'message': 'DICOM metadata extracted successfully',
+                'metadata': DICOMMetadataSerializer(dicom_metadata).data
+            }, status=status.HTTP_200_OK)
+            
+        except InvalidDicomError:
+            return Response({
+                'error': 'File is not a valid DICOM format'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Error reading DICOM file: {str(e)}")
+            return Response({
+                'error': f'Failed to read DICOM file: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def anonymize_dicom(request, upload_id):
+    """
+    Anonymize a DICOM file (remove patient identifying information)
+    """
+    upload = get_object_or_404(UploadFile, id=upload_id)
+    
+    # Check permissions
+    if not request.user.is_staff and upload.patient and upload.patient.primary_doctor != request.user:
+        return Response({
+            'error': 'You do not have permission to anonymize this file'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    # Check if file is DICOM
+    if upload.file_type not in DICOM_MIME_TYPES and not upload.file.name.lower().endswith(DICOM_FILE_EXTENSION):
+        return Response({
+            'error': 'File is not a DICOM medical image'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        file_path = upload.file.path
+        
+        # Read DICOM file
+        ds = pydicom.dcmread(file_path)
+        
+        # Remove patient identifying information
+        tags_to_remove = [
+            'PatientName', 'PatientID', 'PatientBirthDate',
+            'PatientSex', 'PatientAge', 'PatientAddress',
+            'InstitutionName', 'InstitutionAddress',
+            'ReferringPhysicianName', 'PhysicianOfRecord',
+            'StudyDate', 'SeriesDate', 'AcquisitionDate'
+        ]
+        
+        for tag in tags_to_remove:
+            if hasattr(ds, tag):
+                delattr(ds, tag)
+        
+        # Add anonymization note
+        from datetime import datetime
+        ds.AnonymizationNotes = "Anonymized for clinical use"
+        ds.AnonymizationDate = datetime.now().strftime("%Y%m%d")
+        
+        # Save anonymized file (create new file)
+        import os
+        original_dir = os.path.dirname(file_path)
+        original_name = os.path.basename(file_path)
+        anonymized_path = os.path.join(original_dir, f"anonymized_{original_name}")
+        
+        ds.save_as(anonymized_path)
+        
+        # Update metadata
+        try:
+            metadata = upload.dicom_metadata
+            metadata.is_anonymized = True
+            metadata.anonymization_date = timezone.now()
+            metadata.patient_name = ""
+            metadata.patient_id = ""
+            metadata.patient_birth_date = None
+            metadata.institution_name = ""
+            metadata.save()
+        except DICOMMetadata.DoesNotExist:
+            pass
+        
+        # Log the action
+        logger.info(f"DICOM file anonymized: {upload_id} by user {request.user.id}")
+        
+        return Response({
+            'message': 'DICOM file anonymized successfully',
+            'anonymized_path': anonymized_path,
+            'original_file': upload.name,
+            'anonymized_at': timezone.now().isoformat()
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        logger.error(f"Error anonymizing DICOM file: {str(e)}")
+        return Response({
+            'error': f'Failed to anonymize DICOM file: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def update_consent(request, upload_id):
+    """
+    Update patient consent for an upload (HIPAA/GDPR requirement)
+    """
+    upload = get_object_or_404(UploadFile, id=upload_id)
+    
+    # Check permissions - only staff or patient's doctor can update consent
+    if not request.user.is_staff:
+        if not upload.patient:
+            return Response({
+                'error': 'Cannot update consent for upload without patient'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if upload.patient.primary_doctor != request.user:
+            return Response({
+                'error': 'You do not have permission to update consent for this file'
+            }, status=status.HTTP_403_FORBIDDEN)
+    
+    serializer = ConsentUpdateSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    consent_granted = serializer.validated_data['consent_granted']
+    consent_type = serializer.validated_data['consent_type']
+    
+    
+    # Update consent
+    upload.patient_consent = consent_granted
+    
+    if consent_granted:
+        upload.consent_date = timezone.now()
+    else:
+        upload.consent_date = None
+    
+    upload.save()
+    
+    # Log consent update
+    logger.info(f"Consent updated for upload {upload_id}: {consent_type} = {consent_granted} by user {request.user.id}")
+    
+    return Response({
+        'message': f'Consent for {consent_type} updated successfully',
+        'upload_id': str(upload.id),
+        'patient_consent': upload.patient_consent,
+        'consent_date': upload.consent_date,
+        'consent_type': consent_type,
+        'updated_by': request.user.id,
+        'updated_at': timezone.now().isoformat()
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def search_uploads(request):
+    """
+    Search uploads by name, patient, or DICOM metadata
+    """
+    search_term = request.query_params.get('q', '')
+    category = request.query_params.get('category')
+    patient_id = request.query_params.get('patient_id')
+    
+    if not search_term and not category and not patient_id:
+        return Response({
+            'error': 'Please provide a search term, category, or patient_id'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Start with all uploads user can access
+    if request.user.is_staff:
+        uploads = UploadFile.objects.all()
+    else:
+        # Get user's patients
+        patient_ids = Patient.objects.filter(
+            Q(primary_doctor=request.user) | Q(consulting_doctors=request.user)
+        ).distinct().values_list('id', flat=True)
+        
+        uploads = UploadFile.objects.filter(patient_id__in=patient_ids)
+    
+    # Apply search filters
+    if search_term:
+        uploads = uploads.filter(
+            Q(name__icontains=search_term) |
+            Q(file_type__icontains=search_term) |
+            Q(patient__full_name__icontains=search_term) |
+            Q(patient__national_id__icontains=search_term)
+        )
+    
+    if category:
+        uploads = uploads.filter(category=category)
+    
+    if patient_id:
+        uploads = uploads.filter(patient_id=patient_id)
+    
+    # Limit results
+    uploads = uploads.order_by('-created_at')[:50]
+    
+    serializer = UploadFileMinimalSerializer(uploads, many=True, context={'request': request})
+    
+    return Response({
+        'count': uploads.count(),
+        'results': serializer.data,
+        'search_term': search_term,
+        'category': category,
+        'patient_id': patient_id
+    }, status=status.HTTP_200_OK)

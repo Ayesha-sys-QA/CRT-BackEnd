@@ -180,7 +180,8 @@ class UserSerializer(serializers.ModelSerializer):
     address = AddressSerializer(read_only=True)
     emergency_contact = EmergencyContactSerializer(read_only=True)
     hospitals = HospitalInfoSerializer(many=True, read_only=True)
-    primary_hospital = HospitalInfoSerializer(source='primary_hospital', read_only=True)
+    # primary_hospital = HospitalInfoSerializer(source='primary_hospital', read_only=True)
+    primary_hospital = HospitalInfoSerializer(read_only=True)
     license = LicenseSerializer( read_only=True)
     qualifications = QualificationSerializer(many=True, read_only=True)
     certifications = CertificationSerializer(many=True, read_only=True)
@@ -357,19 +358,14 @@ class SimpleUserCreateSerializer(serializers.ModelSerializer):
             username = f"{base_username}{counter}"
             counter += 1
         
-        # Generate random password
-        import random
-        import string
-        random_password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-        
         # Extract role
         role = validated_data.pop('role', 'doctor')
         
-        # Create user with minimal data
+        # Create user WITHOUT PASSWORD
         user = User.objects.create_user(
             username=username,
             email=email,
-            password=random_password,
+            password=None,  # No password initially
             first_time_login=True,
             role=role,
             **{k: v for k, v in validated_data.items() if k != 'email'}
@@ -411,18 +407,29 @@ class SimpleUserCreateSerializer(serializers.ModelSerializer):
 
 class UserUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating user profile"""
+    hospital_name = serializers.CharField(
+        write_only=True, 
+        required=False, 
+        allow_blank=True
+    )
     class Meta:
         model = User
         fields = [
-            'first_name', 'last_name', 'phone', 'title',
+            'first_name', 'last_name', 'national_id', 'phone', 'title',
             'dob', 'gender', 'bio', 'avatar_color',
             'department', 'experience', 'office',
-            'is_favorite', 'status'
+            'is_favorite', 'status', 'hospital_name'
         ]
     
     def validate_phone(self, value):
         if value and not value.replace('+', '').replace(' ', '').isdigit():
             raise serializers.ValidationError("Phone number must contain only digits.")
+        return value
+    
+    def validate_national_id(self, value):
+        # Ensure national_id is unique
+        if User.objects.filter(national_id=value).exclude(id=self.instance.id).exists():
+            raise serializers.ValidationError("National ID already exists.")
         return value
 
 
@@ -434,199 +441,86 @@ class UnifiedLoginSerializer(serializers.Serializer):
         write_only=True,
         style={'input_type': 'password'}
     )
-    new_password = serializers.CharField(
-        required=False,  # Only for first-time login when setting password
-        write_only=True,
-        min_length=8,
-        style={'input_type': 'password'}
-    )
-    confirm_password = serializers.CharField(
-        required=False,  # Only for first-time login
-        write_only=True,
-        style={'input_type': 'password'}
-    )
     
     def validate(self, data):
         email = data.get('email').lower()
         password = data.get('password')
-        new_password = data.get('new_password')
-        confirm_password = data.get('confirm_password')
-
-        user = self._get_user_by_email(email)
-        self._check_user_active(user)
-
-        if user.first_time_login:
-            self._validate_first_time_login(password, new_password, confirm_password, user)
-            data['is_first_time'] = True
-        else:
-            self._validate_regular_login(email, password, user)
-            data['is_first_time'] = False
-
-        data['user'] = user
-        return data
-
-    def _get_user_by_email(self, email):
+        
         try:
-            return User.objects.get(email=email)
+            user = User.objects.get(email=email)
         except User.DoesNotExist:
-            raise serializers.ValidationError({'email': USER_NOT_FOUND_ERROR})
-
-    def _check_user_active(self, user):
+            raise serializers.ValidationError({
+                'email': 'No user found with this email.'
+            })
+        
+        # Check if user is active
         if not user.is_active:
-            raise serializers.ValidationError({'email': ACCOUNT_NOT_ACTIVE_ERROR})
-
-    def _validate_first_time_login(self, password, new_password, confirm_password, user):
-        if password:
-            raise serializers.ValidationError({'password': 'Please use first-time login to set your password.'})
-
-        if not new_password or not confirm_password:
-            raise serializers.ValidationError({'new_password': 'New password and confirmation required for first-time login.'})
-
-        if new_password != confirm_password:
-            raise serializers.ValidationError({'new_password': PASSWORD_MISMATCH_ERROR})
-
-        try:
-            validate_password(new_password, user)
-        except ValidationError as e:
-            raise serializers.ValidationError({'new_password': list(e.messages)})
-
-    def _validate_regular_login(self, email, password, user):
-        if not password:
-            raise serializers.ValidationError({'password': 'Password is required.'})
-
-        auth_user = authenticate(username=email, password=password) or authenticate(username=email.split('@')[0], password=password)
-
-        if auth_user is None or auth_user != user:
-            raise serializers.ValidationError({'password': 'Invalid password.'})
-
-
-# class FirstTimeLoginSerializer(serializers.Serializer):
-#     """Serializer for first-time login (setting password)"""
-#     email = serializers.EmailField(required=True)
-#     password = serializers.CharField(
-#         required=True,
-#         write_only=True,
-#         min_length=8,
-#         style={'input_type': 'password'}
-#     )
-#     confirm_password = serializers.CharField(
-#         required=True,
-#         write_only=True,
-#         style={'input_type': 'password'}
-#     )
+            raise serializers.ValidationError({
+                'email': 'Account is not active.'
+            })
+        
+        # Case 1: First-time login (no password set yet or empty password)
+        if user.first_time_login:
+            # For first-time login, password should NOT be provided
+            # User just logs in with email
+            if password:
+                raise serializers.ValidationError({
+                    'password': 'Password not required for first-time login. Please login with email only.'
+                })
+            
+            data['user'] = user
+            data['is_first_time'] = True
+            data['message'] = 'First-time login successful. Please complete your profile.'
+            
+        # Case 2: Regular login (password already set)
+        else:
+            if not password:
+                raise serializers.ValidationError({
+                    'password': 'Password is required for regular login.'
+                })
+            
+            # Check if password is actually set on user
+            if not user.has_usable_password():
+                raise serializers.ValidationError({
+                    'password': 'Password not set. Please contact administrator.'
+                })
+            
+            # Authenticate user
+            auth_user = authenticate(username=email, password=password)
+            
+            # Try with username as well
+            if auth_user is None:
+                auth_user = authenticate(username=email.split('@')[0], password=password)
+            
+            if auth_user is None or auth_user != user:
+                raise serializers.ValidationError({
+                    'password': 'Invalid password.'
+                })
+            
+            data['user'] = user
+            data['is_first_time'] = False
+            data['message'] = 'Login successful'
+        
+        return data
     
-#     def validate(self, data):
-#         email = data.get('email')
-#         password = data.get('password')
-#         confirm_password = data.get('confirm_password')
+    def save(self):
+        user = self.validated_data['user']
+        is_first_time = self.validated_data['is_first_time']
         
-#         # Check if passwords match
-#         if password != confirm_password:
-#             raise serializers.ValidationError({
-#                 'password': PASSWORD_MISMATCH_ERROR
-#             })
-        
-#         # Validate password strength
-#         try:
-#             validate_password(password)
-#         except ValidationError as e:
-#             raise serializers.ValidationError({'password': list(e.messages)})
-        
-#         # Check if user exists and is first time login
-#         try:
-#             user = User.objects.get(email=email.lower())
-#         except User.DoesNotExist:
-#             raise serializers.ValidationError({
-#                 'email': 'No user found with this email {email}.'
-#             })
-        
-#         if not user.first_time_login:
-#             raise serializers.ValidationError({
-#                 'email': 'This user has already completed first-time login.'
-#             })
-        
-#         data['user'] = user
-#         return data
-    
-#     def save(self):
-#         user = self.validated_data['user']
-#         password = self.validated_data['password']
-        
-#         # Set new password
-#         user.set_password(password)
-        
-#         # Update first_time_login flag
-#         user.first_time_login = False
-        
-#         # Set user as active
-#         user.is_active = True
-        
-#         user.save()
-#         return user
-
-
-# class EmailLoginSerializer(serializers.Serializer):
-#     """Serializer for email-only login (first time)"""
-#     email = serializers.EmailField(required=True)
-    
-#     def validate(self, data):
-#         email = data.get('email').lower()
-        
-#         try:
-#             user = User.objects.get(email=email)
-#         except User.DoesNotExist:
-#             raise serializers.ValidationError({
-#                 'email': USER_NOT_FOUND_ERROR
-#             })
-        
-#         # Check if user can login with email only
-#         if not user.first_time_login:
-#             raise serializers.ValidationError({
-#                 'email': 'Password required for this account.'
-#             })
-        
-#         if not user.is_active:
-#             raise serializers.ValidationError({
-#                 'email': 'Account is not active.'
-#             })
-        
-#         data['user'] = user
-#         return data
-
-
-# class PasswordLoginSerializer(serializers.Serializer):
-#     """Serializer for regular password login"""
-#     email = serializers.EmailField(required=True)
-#     password = serializers.CharField(
-#         required=True,
-#         write_only=True,
-#         style={'input_type': 'password'}
-#     )
-    
-#     def validate(self, data):
-#         email = data.get('email').lower()
-#         password = data.get('password')
-        
-#         # Authenticate user
-#         user = authenticate(username=email, password=password)
-        
-#         if user is None:
-#             # Try with username as well
-#             user = authenticate(username=email.split('@')[0], password=password)
-        
-#         if user is None:
-#             raise serializers.ValidationError({
-#                 'non_field_errors': 'Invalid email or password.'
-#             })
-        
-#         if not user.is_active:
-#             raise serializers.ValidationError({
-#                 'non_field_errors': ACCOUNT_NOT_ACTIVE_ERROR
-#             })
-        
-#         data['user'] = user
-#         return data
-
+        if is_first_time:
+            # First-time login: no password change, just login
+            return {
+                'user': user,
+                'is_first_time': True,
+                'message': 'First-time login successful. Please complete your profile.'
+            }
+        else:
+            # Regular login
+            return {
+                'user': user,
+                'is_first_time': False,
+                'message': 'Login successful'
+            }
 
 class PasswordResetSerializer(serializers.Serializer):
     """Serializer for password reset"""
